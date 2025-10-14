@@ -74,6 +74,24 @@ type DownloadCmd struct {
 	FileReadCommand  []string
 }
 
+// DownloadService encapsulates the download functionality and shared dependencies
+type DownloadService struct {
+	kubeClient kubernetes.Interface
+	config     *rest.Config
+	namespace  string
+	ctx        context.Context
+}
+
+// NewDownloadService creates a new download service with shared dependencies
+func NewDownloadService(ctx context.Context, kubeClient kubernetes.Interface, config *rest.Config, namespace string) *DownloadService {
+	return &DownloadService{
+		kubeClient: kubeClient,
+		config:     config,
+		namespace:  namespace,
+		ctx:        ctx,
+	}
+}
+
 func getDownloadCmd(node *corev1.Node, hostPath, fileName string) *DownloadCmd {
 	nodeOS, err := getNodeOS(node)
 	if err != nil {
@@ -173,6 +191,8 @@ func downloadFromCluster(ctx context.Context, config *rest.Config, namespace str
 		return errors.Wrap(err, "failed to initialize k8s client")
 	}
 
+	downloadService := NewDownloadService(ctx, kubeClient, config, namespace)
+
 	pods, err := getCapturePods(ctx, kubeClient, captureName, namespace)
 	if err != nil {
 		return errors.Wrap(err, "failed to obtain capture pod")
@@ -199,63 +219,63 @@ func downloadFromCluster(ctx context.Context, config *rest.Config, namespace str
 			return errors.New("cannot obtain capture file name from pod annotations")
 		}
 
-		node, err := kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get node information: %w", err)
-		}
-
-		downloadCmd := getDownloadCmd(node, hostPath, fileName)
-
-		fmt.Println("File to be downloaded: ", downloadCmd.SrcFilePath)
-		downloadPod, err := createDownloadPod(ctx, kubeClient, namespace, nodeName, hostPath, captureName, downloadCmd)
+		err = downloadService.DownloadFile(nodeName, hostPath, fileName, captureName)
 		if err != nil {
 			return err
-		}
-
-		fileExists, err := verifyFileExists(ctx, kubeClient, config, downloadPod, downloadCmd)
-		if err != nil || !fileExists {
-			return err
-		}
-
-		fmt.Println("Obtaining file...")
-		exec, err := createDownloadExec(kubeClient, config, downloadPod, downloadCmd)
-		if err != nil {
-			return err
-		}
-
-		var outBuf, errBuf bytes.Buffer
-		streamOpts := remotecommand.StreamOptions{
-			Stdout: &outBuf,
-			Stderr: &errBuf,
-		}
-		if err = exec.StreamWithContext(ctx, streamOpts); err != nil {
-			return fmt.Errorf("failed to exec in download container: %w", err)
-		}
-
-		if outBuf.Len() == 0 {
-			return errors.Wrap(ErrEmptyDownloadOutput, errBuf.String())
-		}
-
-		outputFile := filepath.Join(outputPath, captureName, fileName+".tar.gz")
-		fmt.Printf("Bytes retrieved: %d\n", outBuf.Len())
-
-		err = os.WriteFile(outputFile, outBuf.Bytes(), 0o600)
-		if err != nil {
-			return fmt.Errorf("failed to write file to host: %w", err)
-		}
-
-		fmt.Printf("File written to: %s\n", outputFile)
-
-		err = kubeClient.CoreV1().Pods(namespace).Delete(ctx, downloadPod.Name, metav1.DeleteOptions{})
-		if err != nil {
-			retinacmd.Logger.Warn("Failed to clean up debug pod", zap.String("name", downloadPod.Name), zap.Error(err))
 		}
 	}
 
 	return nil
 }
 
-func getCapturePods(ctx context.Context, kubeClient *kubernetes.Clientset, captureName, namespace string) (*corev1.PodList, error) {
+// DownloadFile downloads a capture file from a specific node
+func (ds *DownloadService) DownloadFile(nodeName, hostPath, fileName, captureName string) error {
+	node, err := ds.kubeClient.CoreV1().Nodes().Get(ds.ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node information: %w", err)
+	}
+
+	downloadCmd := getDownloadCmd(node, hostPath, fileName)
+	if downloadCmd == nil {
+		return ErrUnsupportedNodeOS
+	}
+
+	fmt.Println("File to be downloaded: ", downloadCmd.SrcFilePath)
+	downloadPod, err := ds.createDownloadPod(nodeName, hostPath, captureName, downloadCmd)
+	if err != nil {
+		return err
+	}
+
+	fileExists, err := ds.verifyFileExists(downloadPod, downloadCmd)
+	if err != nil || !fileExists {
+		return err
+	}
+
+	fmt.Println("Obtaining file...")
+	fileContent, err := ds.executeFileDownload(downloadPod, downloadCmd)
+	if err != nil {
+		return err
+	}
+
+	outputFile := filepath.Join(outputPath, captureName, fileName+".tar.gz")
+	fmt.Printf("Bytes retrieved: %d\n", len(fileContent))
+
+	err = os.WriteFile(outputFile, fileContent, 0o600)
+	if err != nil {
+		return fmt.Errorf("failed to write file to host: %w", err)
+	}
+
+	fmt.Printf("File written to: %s\n", outputFile)
+
+	// Ensure cleanup
+	err = ds.kubeClient.CoreV1().Pods(ds.namespace).Delete(ds.ctx, downloadPod.Name, metav1.DeleteOptions{})
+	if err != nil {
+		retinacmd.Logger.Warn("Failed to clean up debug pod", zap.String("name", downloadPod.Name), zap.Error(err))
+	}
+	return nil
+}
+
+func getCapturePods(ctx context.Context, kubeClient kubernetes.Interface, captureName, namespace string) (*corev1.PodList, error) {
 	pods, err := kubeClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: captureLabels.CaptureNameLabel + "=" + captureName,
 	})
@@ -269,13 +289,28 @@ func getCapturePods(ctx context.Context, kubeClient *kubernetes.Clientset, captu
 	return pods, nil
 }
 
-func createDownloadPod(ctx context.Context, kubeClient *kubernetes.Clientset, namespace, nodeName, hostPath, captureName string, downloadCmd *DownloadCmd) (*corev1.Pod, error) {
+// executeFileDownload downloads the file content from the pod
+func (ds *DownloadService) executeFileDownload(pod *corev1.Pod, downloadCmd *DownloadCmd) ([]byte, error) {
+	content, err := ds.createDownloadExec(pod, downloadCmd.FileReadCommand)
+	if err != nil {
+		return nil, fmt.Errorf("failed to exec file download in container: %w", err)
+	}
+
+	if len(content) == 0 {
+		return nil, ErrEmptyDownloadOutput
+	}
+
+	return []byte(content), nil
+}
+
+// createDownloadPod creates a pod for downloading files from the host
+func (ds *DownloadService) createDownloadPod(nodeName, hostPath, captureName string, downloadCmd *DownloadCmd) (*corev1.Pod, error) {
 	podName := captureName + "-download-" + rand.String(5)
 
 	podSpec := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
-			Namespace: namespace,
+			Namespace: ds.namespace,
 			Labels:    captureUtils.GetDownloadLabelsFromCaptureName(captureName),
 		},
 		Spec: corev1.PodSpec{
@@ -308,21 +343,26 @@ func createDownloadPod(ctx context.Context, kubeClient *kubernetes.Clientset, na
 	}
 
 	fmt.Printf("Creating download pod: %s\n", podName)
-	_, err := kubeClient.CoreV1().Pods(namespace).Create(ctx, podSpec, metav1.CreateOptions{})
+	_, err := ds.kubeClient.CoreV1().Pods(ds.namespace).Create(ds.ctx, podSpec, metav1.CreateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create download pod: %w", err)
 	}
 
+	return ds.waitForPodReady(podName)
+}
+
+// waitForPodReady waits for the pod to be in running state
+func (ds *DownloadService) waitForPodReady(podName string) (*corev1.Pod, error) {
 	timeout := time.After(30 * time.Second)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	var pod *corev1.Pod
+	
 	for {
 		select {
 		case <-timeout:
 			return nil, errors.Wrap(ErrFailedToCreateDownloadPod, "timeout waiting for download pod to become ready")
 		case <-ticker.C:
-			pod, err = kubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+			pod, err := ds.kubeClient.CoreV1().Pods(ds.namespace).Get(ds.ctx, podName, metav1.GetOptions{})
 			if err != nil {
 				return nil, fmt.Errorf("failed to get download pod: %w", err)
 			}
@@ -336,44 +376,19 @@ func createDownloadPod(ctx context.Context, kubeClient *kubernetes.Clientset, na
 	}
 }
 
-func verifyFileExists(ctx context.Context, kubeClient *kubernetes.Clientset, config *rest.Config, pod *corev1.Pod, downloadCmd *DownloadCmd) (bool, error) {
+// verifyFileExists checks if the target file exists and is accessible
+func (ds *DownloadService) verifyFileExists(pod *corev1.Pod, downloadCmd *DownloadCmd) (bool, error) {
 	maxAttempts := 3
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		checkReq := kubeClient.CoreV1().RESTClient().Post().
-			Resource("pods").
-			Name(pod.Name).
-			Namespace(pod.Namespace).
-			SubResource("exec").
-			VersionedParams(&corev1.PodExecOptions{
-				Container: "download",
-				Command:   downloadCmd.FileCheckCommand,
-				Stdout:    true,
-				Stderr:    true,
-			}, scheme.ParameterCodec)
-
-		checkExec, err := remotecommand.NewSPDYExecutor(config, "POST", checkReq.URL())
+		checkOutput, err := ds.createDownloadExec(pod, downloadCmd.FileCheckCommand)
 		if err != nil {
-			if attempt == maxAttempts {
-				return false, fmt.Errorf("failed to create check executor after %d attempts: %w", attempt, err)
-			}
-			time.Sleep(time.Duration(attempt*2) * time.Second)
-			continue
-		}
-
-		var checkBuf bytes.Buffer
-		if err = checkExec.StreamWithContext(ctx, remotecommand.StreamOptions{
-			Stdout: &checkBuf,
-			Stderr: &checkBuf,
-		}); err != nil {
 			if attempt == maxAttempts {
 				return false, fmt.Errorf("failed to check file existence after %d attempts: %w", attempt, err)
 			}
 			time.Sleep(time.Duration(attempt*2) * time.Second)
 			continue
 		}
-
-		checkOutput := checkBuf.String()
 
 		if strings.Contains(checkOutput, "FILE_EXISTS") {
 			return true, nil
@@ -385,24 +400,36 @@ func verifyFileExists(ctx context.Context, kubeClient *kubernetes.Clientset, con
 	return false, errors.Wrap(ErrFileNotAccessible, downloadCmd.SrcFilePath)
 }
 
-func createDownloadExec(kubeClient *kubernetes.Clientset, config *rest.Config, pod *corev1.Pod, downloadCmd *DownloadCmd) (remotecommand.Executor, error) {
-	req := kubeClient.CoreV1().RESTClient().Post().
+// createDownloadExec executes a command in the pod and returns the output
+func (ds *DownloadService) createDownloadExec(pod *corev1.Pod, command []string) (string, error) {
+	req := ds.kubeClient.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(pod.Name).
 		Namespace(pod.Namespace).
 		SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
-			Container: "download",
-			Command:   downloadCmd.FileReadCommand,
+			Container: captureConstants.DownloadContainername,
+			Command:   command,
 			Stdout:    true,
 			Stderr:    true,
 		}, scheme.ParameterCodec)
 
-	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	exec, err := remotecommand.NewSPDYExecutor(ds.config, "POST", req.URL())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create executor: %w", err)
+		return "", fmt.Errorf("failed to create executor: %w", err)
 	}
-	return exec, nil
+
+	var outBuf, errBuf bytes.Buffer
+	streamOpts := remotecommand.StreamOptions{
+		Stdout: &outBuf,
+		Stderr: &errBuf,
+	}
+	
+	if err = exec.StreamWithContext(ds.ctx, streamOpts); err != nil {
+		return "", fmt.Errorf("failed to exec command: %w (stderr: %s)", err, errBuf.String())
+	}
+
+	return outBuf.String(), nil
 }
 
 func downloadFromBlob() error {
