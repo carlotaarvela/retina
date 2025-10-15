@@ -49,9 +49,21 @@ const (
 )
 
 var (
-	blobURL     string
-	captureName string
-	outputPath  string
+	blobURL string
+	// Error variables for lint compliance (err113)
+	ErrCreateDirectory    = errors.New("failed to create directory")
+	ErrGetNodeInfo        = errors.New("failed to get node information")
+	ErrWriteFileToHost    = errors.New("failed to write file to host")
+	ErrObtainPodList      = errors.New("failed to obtain list of pods")
+	ErrExecFileDownload   = errors.New("failed to exec file download in container")
+	ErrCreateDownloadPod  = errors.New("failed to create download pod")
+	ErrGetDownloadPod     = errors.New("failed to get download pod")
+	ErrCheckFileExistence = errors.New("failed to check file existence")
+	ErrCreateExecutor     = errors.New("failed to create executor")
+	ErrExecCommand        = errors.New("failed to exec command")
+	ErrCreateOutputDir    = errors.New("failed to create output directory")
+	captureName           string
+	outputPath            string
 )
 
 var (
@@ -200,7 +212,7 @@ func downloadFromCluster(ctx context.Context, config *rest.Config, namespace str
 
 	err = os.MkdirAll(filepath.Join(outputPath, captureName), 0o775)
 	if err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
+		return errors.Wrap(err, ErrCreateDirectory.Error())
 	}
 
 	for i := range pods.Items {
@@ -232,7 +244,7 @@ func downloadFromCluster(ctx context.Context, config *rest.Config, namespace str
 func (ds *DownloadService) DownloadFile(nodeName, hostPath, fileName, captureName string) error {
 	node, err := ds.kubeClient.CoreV1().Nodes().Get(ds.ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to get node information: %w", err)
+		return errors.Wrap(err, ErrGetNodeInfo.Error())
 	}
 
 	downloadCmd := getDownloadCmd(node, hostPath, fileName)
@@ -262,7 +274,7 @@ func (ds *DownloadService) DownloadFile(nodeName, hostPath, fileName, captureNam
 
 	err = os.WriteFile(outputFile, fileContent, 0o600)
 	if err != nil {
-		return fmt.Errorf("failed to write file to host: %w", err)
+		return errors.Wrap(err, ErrWriteFileToHost.Error())
 	}
 
 	fmt.Printf("File written to: %s\n", outputFile)
@@ -280,7 +292,7 @@ func getCapturePods(ctx context.Context, kubeClient kubernetes.Interface, captur
 		LabelSelector: captureLabels.CaptureNameLabel + "=" + captureName,
 	})
 	if err != nil {
-		return &corev1.PodList{}, fmt.Errorf("failed to obtain list of pods: %w", err)
+		return &corev1.PodList{}, errors.Wrap(err, ErrObtainPodList.Error())
 	}
 	if len(pods.Items) == 0 {
 		return &corev1.PodList{}, errors.Wrap(ErrNoPodFound, captureName)
@@ -293,10 +305,10 @@ func getCapturePods(ctx context.Context, kubeClient kubernetes.Interface, captur
 func (ds *DownloadService) executeFileDownload(pod *corev1.Pod, downloadCmd *DownloadCmd) ([]byte, error) {
 	content, err := ds.createDownloadExec(pod, downloadCmd.FileReadCommand)
 	if err != nil {
-		return nil, fmt.Errorf("failed to exec file download in container: %w", err)
+		return nil, errors.Wrap(err, ErrExecFileDownload.Error())
 	}
 
-	if len(content) == 0 {
+	if content == "" {
 		return nil, ErrEmptyDownloadOutput
 	}
 
@@ -345,7 +357,7 @@ func (ds *DownloadService) createDownloadPod(nodeName, hostPath, captureName str
 	fmt.Printf("Creating download pod: %s\n", podName)
 	_, err := ds.kubeClient.CoreV1().Pods(ds.namespace).Create(ds.ctx, podSpec, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create download pod: %w", err)
+		return nil, errors.Wrap(err, ErrCreateDownloadPod.Error())
 	}
 
 	return ds.waitForPodReady(podName)
@@ -356,7 +368,7 @@ func (ds *DownloadService) waitForPodReady(podName string) (*corev1.Pod, error) 
 	timeout := time.After(30 * time.Second)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-timeout:
@@ -364,7 +376,7 @@ func (ds *DownloadService) waitForPodReady(podName string) (*corev1.Pod, error) 
 		case <-ticker.C:
 			pod, err := ds.kubeClient.CoreV1().Pods(ds.namespace).Get(ds.ctx, podName, metav1.GetOptions{})
 			if err != nil {
-				return nil, fmt.Errorf("failed to get download pod: %w", err)
+				return nil, errors.Wrap(err, ErrGetDownloadPod.Error())
 			}
 			if pod.Status.Phase == corev1.PodRunning {
 				return pod, nil
@@ -384,7 +396,7 @@ func (ds *DownloadService) verifyFileExists(pod *corev1.Pod, downloadCmd *Downlo
 		checkOutput, err := ds.createDownloadExec(pod, downloadCmd.FileCheckCommand)
 		if err != nil {
 			if attempt == maxAttempts {
-				return false, fmt.Errorf("failed to check file existence after %d attempts: %w", attempt, err)
+				return false, errors.Wrapf(err, "failed to check file existence after %d attempts", attempt)
 			}
 			time.Sleep(time.Duration(attempt*2) * time.Second)
 			continue
@@ -416,7 +428,7 @@ func (ds *DownloadService) createDownloadExec(pod *corev1.Pod, command []string)
 
 	exec, err := remotecommand.NewSPDYExecutor(ds.config, "POST", req.URL())
 	if err != nil {
-		return "", fmt.Errorf("failed to create executor: %w", err)
+		return "", errors.Wrap(err, ErrCreateExecutor.Error())
 	}
 
 	var outBuf, errBuf bytes.Buffer
@@ -424,9 +436,9 @@ func (ds *DownloadService) createDownloadExec(pod *corev1.Pod, command []string)
 		Stdout: &outBuf,
 		Stderr: &errBuf,
 	}
-	
+
 	if err = exec.StreamWithContext(ds.ctx, streamOpts); err != nil {
-		return "", fmt.Errorf("failed to exec command: %w (stderr: %s)", err, errBuf.String())
+		return "", errors.Wrapf(err, "failed to exec command (stderr: %s)", errBuf.String())
 	}
 
 	return outBuf.String(), nil
@@ -450,7 +462,7 @@ func downloadFromBlob() error {
 	splitPath := strings.SplitN(containerPath, "/", 2)
 	containerName := splitPath[0]
 
-	params := storage.ListBlobsParameters{Prefix: *opts.Name}
+	params := storage.ListBlobsParameters{Prefix: captureName}
 	blobList, err := blobService.GetContainerReference(containerName).ListBlobs(params)
 	if err != nil {
 		retinacmd.Logger.Error("err: ", zap.Error(err))
@@ -459,12 +471,12 @@ func downloadFromBlob() error {
 
 	if len(blobList.Blobs) == 0 {
 		retinacmd.Logger.Error("err: ", zap.Error(err))
-		return errors.Errorf("no blobs found with prefix: %s", *opts.Name)
+		return errors.Errorf("no blobs found with prefix: %s", captureName)
 	}
 
 	err = os.MkdirAll(outputPath, 0o775)
 	if err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
+		return errors.Wrap(err, ErrCreateOutputDir.Error())
 	}
 
 	for i := range blobList.Blobs {

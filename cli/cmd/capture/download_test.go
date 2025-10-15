@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
 	captureConstants "github.com/microsoft/retina/pkg/capture/constants"
 	"github.com/microsoft/retina/pkg/label"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,11 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	clienttesting "k8s.io/client-go/testing"
+)
+
+const (
+	testCapture = "test-capture"
+	testFile    = "test-file"
 )
 
 func NewLinuxNode(name string) *corev1.Node {
@@ -110,7 +116,7 @@ func TestDownloadFromCluster(t *testing.T) {
 	// Set global variables for testing
 	originalCaptureName := captureName
 	originalOutputPath := outputPath
-	captureName = "test-capture"
+	captureName = testCapture
 	outputPath = tempDir
 	defer func() {
 		captureName = originalCaptureName
@@ -132,8 +138,8 @@ func TestDownloadFromCluster(t *testing.T) {
 					NewLinuxNode("linux-node-1"),
 					NewWindowsNode("windows-node-1"),
 					NewNamespace("default"),
-					NewCapturePodsWithStatus("test-capture", "default", "linux-node-1", corev1.PodSucceeded),
-					NewCapturePodsWithStatus("test-capture", "default", "windows-node-1", corev1.PodSucceeded),
+					NewCapturePodsWithStatus(testCapture, "default", "linux-node-1", corev1.PodSucceeded),
+					NewCapturePodsWithStatus(testCapture, "default", "windows-node-1", corev1.PodSucceeded),
 				}
 			},
 			wantErr:       false,
@@ -192,9 +198,9 @@ func TestDownloadFromCluster(t *testing.T) {
 				if pod.Status.Phase != corev1.PodSucceeded {
 					t.Errorf("Expected pod phase to be Succeeded, got %s", pod.Status.Phase)
 				}
-				
+
 				if pod.Labels[label.CaptureNameLabel] != captureName {
-					t.Errorf("Expected pod to have capture name label %s, got %s", 
+					t.Errorf("Expected pod to have capture name label %s, got %s",
 						captureName, pod.Labels[label.CaptureNameLabel])
 				}
 
@@ -202,7 +208,7 @@ func TestDownloadFromCluster(t *testing.T) {
 				if _, ok := pod.Annotations[captureConstants.CaptureHostPathAnnotationKey]; !ok {
 					t.Errorf("Expected pod to have host path annotation")
 				}
-				
+
 				if _, ok := pod.Annotations[captureConstants.CaptureFilenameAnnotationKey]; !ok {
 					t.Errorf("Expected pod to have filename annotation")
 				}
@@ -280,7 +286,7 @@ func TestGetDownloadCmd(t *testing.T) {
 			name:     "Linux node download cmd",
 			node:     NewLinuxNode("linux-test"),
 			hostPath: "/tmp/captures",
-			fileName: "test-capture",
+			fileName: testCapture,
 			validate: func(t *testing.T, cmd *DownloadCmd) {
 				if cmd == nil {
 					t.Fatal("Expected DownloadCmd, got nil")
@@ -288,7 +294,7 @@ func TestGetDownloadCmd(t *testing.T) {
 				if !strings.Contains(cmd.ContainerImage, "busybox") {
 					t.Errorf("Expected Linux container image to contain 'busybox', got %s", cmd.ContainerImage)
 				}
-				if !strings.Contains(cmd.SrcFilePath, "/host/tmp/captures/test-capture.tar.gz") {
+				if !strings.Contains(cmd.SrcFilePath, "/host/tmp/captures/"+testCapture+".tar.gz") {
 					t.Errorf("Expected Linux source file path to match pattern, got %s", cmd.SrcFilePath)
 				}
 				if len(cmd.FileReadCommand) == 0 || cmd.FileReadCommand[0] != "cat" {
@@ -300,7 +306,7 @@ func TestGetDownloadCmd(t *testing.T) {
 			name:     "Windows node download cmd",
 			node:     NewWindowsNode("windows-test"),
 			hostPath: "/tmp/captures",
-			fileName: "test-capture",
+			fileName: testCapture,
 			validate: func(t *testing.T, cmd *DownloadCmd) {
 				if cmd == nil {
 					t.Fatal("Expected DownloadCmd, got nil")
@@ -308,7 +314,7 @@ func TestGetDownloadCmd(t *testing.T) {
 				if !strings.Contains(cmd.ContainerImage, "nanoserver") {
 					t.Errorf("Expected Windows container image to contain 'nanoserver', got %s", cmd.ContainerImage)
 				}
-				if !strings.Contains(cmd.SrcFilePath, "C:\\host\\tmp\\captures\\test-capture.tar.gz") {
+				if !strings.Contains(cmd.SrcFilePath, "C:\\host\\tmp\\captures\\"+testCapture+".tar.gz") {
 					t.Errorf("Expected Windows source file path to match pattern, got %s", cmd.SrcFilePath)
 				}
 				if len(cmd.FileReadCommand) == 0 || cmd.FileReadCommand[0] != "cmd" {
@@ -409,12 +415,12 @@ func TestGetCapturePods(t *testing.T) {
 	}{
 		{
 			name:        "find capture pods successfully",
-			captureName: "test-capture",
+			captureName: testCapture,
 			namespace:   "default",
 			setupPods: func() []runtime.Object {
 				return []runtime.Object{
-					NewCapturePodsWithStatus("test-capture", "default", "node1", corev1.PodSucceeded),
-					NewCapturePodsWithStatus("test-capture", "default", "node2", corev1.PodSucceeded),
+					NewCapturePodsWithStatus(testCapture, "default", "node1", corev1.PodSucceeded),
+					NewCapturePodsWithStatus(testCapture, "default", "node2", corev1.PodSucceeded),
 				}
 			},
 			expectedCount: 2,
@@ -520,7 +526,7 @@ func TestDownloadServiceMethods(t *testing.T) {
 			KeepAliveCommand: []string{"sh", "-c", "echo 'Download pod ready'; sleep 3600"},
 		}
 
-		pod, err := service.createDownloadPod("test-node", "/tmp/captures", "test-capture", downloadCmd)
+		pod, err := service.createDownloadPod("test-node", "/tmp/captures", testCapture, downloadCmd)
 		if err != nil {
 			t.Fatalf("Expected no error, got: %v", err)
 		}
@@ -599,7 +605,7 @@ func TestDownloadServiceErrorHandling(t *testing.T) {
 			t.Fatalf("Failed to create test node: %v", err)
 		}
 
-		err = service.DownloadFile("unsupported-node", "/tmp", "test-file", "test-capture")
+		err = service.DownloadFile("unsupported-node", "/tmp", testFile, testCapture)
 		if err == nil {
 			t.Error("Expected error for unsupported node OS, got nil")
 		}
@@ -610,7 +616,7 @@ func TestDownloadServiceErrorHandling(t *testing.T) {
 	})
 
 	t.Run("DownloadFile handles missing node", func(t *testing.T) {
-		err := service.DownloadFile("nonexistent-node", "/tmp", "test-file", "test-capture")
+		err := service.DownloadFile("nonexistent-node", "/tmp", testFile, testCapture)
 		if err == nil {
 			t.Error("Expected error for missing node, got nil")
 		}
@@ -629,16 +635,16 @@ func TestDownloadCommandFlags(t *testing.T) {
 	}{
 		{
 			name: "valid name flag provided",
-			args: []string{"--name", "test-capture"},
+			args: []string{"--name", testCapture},
 			validate: func(t *testing.T, cmd *cobra.Command) {
 				nameFlag := cmd.Flag("name")
 				if nameFlag == nil {
 					t.Error("Expected name flag to exist")
 					return
 				}
-				
-				if nameFlag.Value.String() != "test-capture" {
-					t.Errorf("Expected name flag value 'test-capture', got '%s'", nameFlag.Value.String())
+
+				if nameFlag.Value.String() != testCapture {
+					t.Errorf("Expected name flag value '%s', got '%s'", testCapture, nameFlag.Value.String())
 				}
 			},
 		},
@@ -646,25 +652,25 @@ func TestDownloadCommandFlags(t *testing.T) {
 			name: "valid blob-url flag provided",
 			args: []string{"--blob-url", "https://storageaccount.blob.core.windows.net/container/blob?sastoken"},
 			validate: func(t *testing.T, cmd *cobra.Command) {
-				blobUrlFlag := cmd.Flag("blob-url")
-				if blobUrlFlag == nil {
+				blobURLFlag := cmd.Flag("blob-url")
+				if blobURLFlag == nil {
 					t.Error("Expected blob-url flag to exist")
 					return
 				}
-				
+
 				expectedURL := "https://storageaccount.blob.core.windows.net/container/blob?sastoken"
-				if blobUrlFlag.Value.String() != expectedURL {
-					t.Errorf("Expected blob-url flag value '%s', got '%s'", expectedURL, blobUrlFlag.Value.String())
+				if blobURLFlag.Value.String() != expectedURL {
+					t.Errorf("Expected blob-url flag value '%s', got '%s'", expectedURL, blobURLFlag.Value.String())
 				}
 			},
 		},
 		{
 			name: "name with custom output path",
-			args: []string{"--name", "test-capture", "--output", "/tmp/downloads"},
+			args: []string{"--name", testCapture, "--output", "/tmp/downloads"},
 			validate: func(t *testing.T, cmd *cobra.Command) {
 				nameFlag := cmd.Flag("name")
 				outputFlag := cmd.Flag("output")
-				
+
 				if nameFlag == nil {
 					t.Error("Expected name flag to exist")
 					return
@@ -673,11 +679,11 @@ func TestDownloadCommandFlags(t *testing.T) {
 					t.Error("Expected output flag to exist")
 					return
 				}
-				
-				if nameFlag.Value.String() != "test-capture" {
-					t.Errorf("Expected name flag value 'test-capture', got '%s'", nameFlag.Value.String())
+
+				if nameFlag.Value.String() != testCapture {
+					t.Errorf("Expected name flag value '%s', got '%s'", testCapture, nameFlag.Value.String())
 				}
-				
+
 				if outputFlag.Value.String() != "/tmp/downloads" {
 					t.Errorf("Expected output flag value '/tmp/downloads', got '%s'", outputFlag.Value.String())
 				}
@@ -685,26 +691,26 @@ func TestDownloadCommandFlags(t *testing.T) {
 		},
 		{
 			name: "both name and blob-url flags",
-			args: []string{"--name", "test-capture", "--blob-url", "https://example.com/blob"},
+			args: []string{"--name", testCapture, "--blob-url", "https://example.com/blob"},
 			validate: func(t *testing.T, cmd *cobra.Command) {
 				nameFlag := cmd.Flag("name")
-				blobUrlFlag := cmd.Flag("blob-url")
-				
+				blobURLFlag := cmd.Flag("blob-url")
+
 				if nameFlag == nil {
 					t.Error("Expected name flag to exist")
 					return
 				}
-				if blobUrlFlag == nil {
+				if blobURLFlag == nil {
 					t.Error("Expected blob-url flag to exist")
 					return
 				}
-				
-				if nameFlag.Value.String() != "test-capture" {
-					t.Errorf("Expected name flag value 'test-capture', got '%s'", nameFlag.Value.String())
+
+				if nameFlag.Value.String() != testCapture {
+					t.Errorf("Expected name flag value '%s', got '%s'", testCapture, nameFlag.Value.String())
 				}
-				
-				if blobUrlFlag.Value.String() != "https://example.com/blob" {
-					t.Errorf("Expected blob-url flag value 'https://example.com/blob', got '%s'", blobUrlFlag.Value.String())
+
+				if blobURLFlag.Value.String() != "https://example.com/blob" {
+					t.Errorf("Expected blob-url flag value 'https://example.com/blob', got '%s'", blobURLFlag.Value.String())
 				}
 			},
 		},
@@ -722,35 +728,35 @@ func TestDownloadCommandFlags(t *testing.T) {
 					captureName = originalCaptureName
 					blobURL = originalBlobURL
 				}()
-				
+
 				// Test the validation condition directly
 				if captureName == "" && blobURL == "" {
 					t.Log("Correctly identified missing required flags")
 				} else {
 					t.Error("Should have identified missing required flags")
 				}
-				
+
 				// Verify the command has the expected flags defined
 				nameFlag := cmd.Flag("name")
-				blobUrlFlag := cmd.Flag("blob-url")
+				blobURLFlag := cmd.Flag("blob-url")
 				outputFlag := cmd.Flag("output")
-				
+
 				if nameFlag == nil {
 					t.Error("Expected name flag to be defined")
 				}
-				if blobUrlFlag == nil {
+				if blobURLFlag == nil {
 					t.Error("Expected blob-url flag to be defined")
 				}
 				if outputFlag == nil {
 					t.Error("Expected output flag to be defined")
 				}
-				
+
 				// Test that both flags have empty default values
 				if nameFlag != nil && nameFlag.DefValue != "" {
 					t.Errorf("Expected name flag default to be empty, got '%s'", nameFlag.DefValue)
 				}
-				if blobUrlFlag != nil && blobUrlFlag.DefValue != "" {
-					t.Errorf("Expected blob-url flag default to be empty, got '%s'", blobUrlFlag.DefValue)
+				if blobURLFlag != nil && blobURLFlag.DefValue != "" {
+					t.Errorf("Expected blob-url flag default to be empty, got '%s'", blobURLFlag.DefValue)
 				}
 			},
 		},
@@ -760,13 +766,13 @@ func TestDownloadCommandFlags(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := NewDownloadSubCommand()
-			
+
 			// Parse flags without executing the command
 			err := cmd.ParseFlags(tc.args)
 			if err != nil {
 				t.Fatalf("Failed to parse flags: %v", err)
 			}
-			
+
 			tc.validate(t, cmd)
 		})
 	}
